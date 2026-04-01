@@ -81,14 +81,14 @@ func defaultConfig() Config {
 		EnableTCP:       envBool("ENABLE_TCP", true),
 		EnableHTTP:      envBool("ENABLE_HTTP", true),
 		ArenaBytes:      envInt("ARENA_BYTES", 2*1024*1024), // 2 MiB
-		MaxConn:         envInt("MAX_CONN", 64),             // micro env: keep goroutine count small
+		MaxConn:         envInt("MAX_CONN", 32),             // micro env: 32 conns ≈ 32 goroutines + ~256 KB heap
 		MaxLineBytes:    envInt("MAX_LINE_BYTES", 96),
 		ReadTimeout:     envDuration("READ_TIMEOUT", 10*time.Second),
 		WriteTimeout:    envDuration("WRITE_TIMEOUT", 5*time.Second),
 		IdleTimeout:     envDuration("IDLE_TIMEOUT", 30*time.Second),
 		CmdsPerSec:      envInt("CMDS_PER_SEC", 128),
 		DFGCooldown:     envDuration("DFG_COOLDOWN", 5*time.Minute),
-		AutoDFGInterval: envDuration("AUTO_DFG_INTERVAL", 1*time.Minute),
+		AutoDFGInterval: envDuration("AUTO_DFG_INTERVAL", 5*time.Minute),
 		AutoDFGRatioPct: envInt("AUTO_DFG_RATIO_PCT", 25),
 		AutoDFGMinSlots: uint64(envInt("AUTO_DFG_MIN_SLOTS", 1024)),
 		GoMaxProcs:      envInt("GOMAXPROCS", 1), // 1 is safe on a shared 1-core host
@@ -120,6 +120,8 @@ type Server struct {
 
 	// scanPool recycles scanner backing buffers — avoids per-connection alloc.
 	scanPool sync.Pool
+	// writerPool recycles bufio.Writer instances — avoids per-connection alloc.
+	writerPool sync.Pool
 }
 
 func NewServer(cfg Config) *Server {
@@ -140,6 +142,12 @@ func NewServer(cfg Config) *Server {
 			return &b
 		},
 	}
+	s.writerPool = sync.Pool{
+		New: func() any {
+			// 256 bytes covers all response lines we ever emit.
+			return bufio.NewWriterSize(nil, 256)
+		},
+	}
 	return s
 }
 
@@ -152,34 +160,39 @@ func (s *Server) Run() error {
 	go s.autoDFGLoop()
 
 	errCh := make(chan error, 2)
-	started := 0
+
+	var tcpLn net.Listener
+	var httpSrv *http.Server
 
 	if s.cfg.EnableTCP {
-		started++
-		go func() { errCh <- s.runTCP() }()
-	}
-	if s.cfg.EnableHTTP {
-		started++
-		go func() { errCh <- s.runHTTP() }()
-	}
-
-	for i := 0; i < started; i++ {
-		if err := <-errCh; err != nil {
+		ln, err := net.Listen("tcp", s.cfg.ListenAddr)
+		if err != nil {
 			close(s.done)
 			return err
 		}
+		tcpLn = ln
+		go func() { errCh <- s.serveTCP(ln) }()
 	}
+	if s.cfg.EnableHTTP {
+		srv := s.buildHTTPServer()
+		httpSrv = srv
+		go func() { errCh <- s.serveHTTP(srv) }()
+	}
+
+	// Wait for first transport failure; tear down the other.
+	err := <-errCh
 	close(s.done)
-	return nil
+	if tcpLn != nil {
+		_ = tcpLn.Close()
+	}
+	if httpSrv != nil {
+		_ = httpSrv.Close()
+	}
+	return err
 }
 
-// runTCP starts the TCP listener and blocks until it returns an error or the
-// listener is closed.
-func (s *Server) runTCP() error {
-	ln, err := net.Listen("tcp", s.cfg.ListenAddr)
-	if err != nil {
-		return err
-	}
+// serveTCP accepts connections on an already-bound listener.
+func (s *Server) serveTCP(ln net.Listener) error {
 	defer ln.Close()
 
 	log.Printf("listen=%s arena_bytes=%d slots=%d max_conn=%d gomaxprocs=%d",
@@ -215,11 +228,10 @@ func (s *Server) runTCP() error {
 	}
 }
 
-func (s *Server) runHTTP() error {
+func (s *Server) buildHTTPServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleHTTP)
-
-	server := &http.Server{
+	return &http.Server{
 		Addr:              s.cfg.HTTPListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -227,7 +239,9 @@ func (s *Server) runHTTP() error {
 		WriteTimeout:      s.cfg.WriteTimeout,
 		IdleTimeout:       s.cfg.IdleTimeout,
 	}
+}
 
+func (s *Server) serveHTTP(server *http.Server) error {
 	log.Printf("http_listen=%s", s.cfg.HTTPListenAddr)
 	err := server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -246,15 +260,19 @@ func (s *Server) handleConn(conn net.Conn) {
 	buf := *bufPtr
 	defer s.scanPool.Put(bufPtr)
 
+	// Borrow a pooled writer — avoids heap alloc per connection.
+	writerPtr := s.writerPool.Get().(*bufio.Writer)
+	writerPtr.Reset(conn)
+	defer s.writerPool.Put(writerPtr)
+	writer := writerPtr
+
 	reader := bufio.NewScanner(conn)
 	reader.Buffer(buf, s.cfg.MaxLineBytes)
-
-	// 256 bytes covers all response lines we ever emit.
-	writer := bufio.NewWriterSize(conn, 256)
 
 	rl := newRateLimiter(s.cfg.CmdsPerSec)
 
 	for {
+		// Set read deadline once before each blocking Scan call.
 		_ = conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
 
 		if !reader.Scan() {
@@ -331,18 +349,20 @@ func (r *rateLimiter) Allow() bool {
 
 func (s *Server) exec(line string) string {
 	// PING is by far the most frequent command; short-circuit before timing.
+	// opsTotal is incremented by the caller (handleConn / runHTTPCommand).
 	cmd, rest := splitFirst(line)
 	if strings.EqualFold(cmd, "PING") {
-		s.opsTotal.Add(1) // counted here so we can return early
 		return "OK PONG"
 	}
+	// Uppercase once here so dispatch receives a canonical token.
+	cmd = strings.ToUpper(cmd)
 	start := time.Now()
 	resp := s.dispatch(cmd, rest)
 	return appendProcessingTime(resp, time.Since(start))
 }
 
 func (s *Server) dispatch(cmd, rest string) string {
-	switch strings.ToUpper(cmd) {
+	switch cmd { // already uppercased by exec
 	case "STATS":
 		active := s.activeSlots.Load()
 		tomb := s.tombstones.Load()
@@ -359,9 +379,12 @@ func (s *Server) dispatch(cmd, rest string) string {
 		if !ok {
 			return "ERR bad index"
 		}
-		value, flag, version, ok := s.view(idx)
-		if !ok {
+		value, flag, version, status := s.view(idx)
+		switch status {
+		case viewChecksumErr:
 			return "ERR checksum"
+		case viewNotActive:
+			return "ERR not active"
 		}
 		return fmt.Sprintf("OK value=%d flag=%d version=%d", value, flag, version)
 
@@ -445,7 +468,12 @@ func (s *Server) incdsc(args string, increment bool) string {
 	if !ok {
 		return "ERR not active"
 	}
-	return fmt.Sprintf("OK value=%d", value)
+	// Stack-allocated response — avoids fmt.Sprintf heap alloc on hot path.
+	var b [32]byte
+	n := copy(b[:], "OK value=")
+	dst := strconv.AppendUint(b[n:n], uint64(value), 10)
+	n += len(dst)
+	return string(b[:n])
 }
 
 // appendProcessingTime appends backend_processing_us=N without heap alloc.
@@ -464,7 +492,15 @@ func appendProcessingTime(resp string, elapsed time.Duration) string {
 
 // ─── Slot operations ──────────────────────────────────────────────────────
 
-func (s *Server) view(idx uint32) (uint32, uint8, uint16, bool) {
+type viewStatus uint8
+
+const (
+	viewOK          viewStatus = iota
+	viewNotActive              // flag == FlagDel (free or tombstone)
+	viewChecksumErr            // stored checksum doesn't match computed
+)
+
+func (s *Server) view(idx uint32) (uint32, uint8, uint16, viewStatus) {
 	s.barrier.RLock()
 	defer s.barrier.RUnlock()
 
@@ -477,7 +513,13 @@ func (s *Server) view(idx uint32) (uint32, uint8, uint16, bool) {
 	flag := s.arena[off+OffFlag]
 	version := readU16(s.arena[off+OffVersion:])
 	checksum := s.arena[off+OffChecksum]
-	return value, flag, version, checksum == calcChecksum(value, flag, version)
+	if flag == FlagDel {
+		return 0, flag, version, viewNotActive
+	}
+	if checksum != calcChecksum(value, flag, version) {
+		return 0, flag, version, viewChecksumErr
+	}
+	return value, flag, version, viewOK
 }
 
 func (s *Server) upsert(idx uint32, value uint32) {
@@ -1052,12 +1094,12 @@ func mapCommandError(message string) *httpError {
 }
 
 func readJSONBody(r *http.Request) (map[string]any, *httpError) {
-	defer r.Body.Close()
 	if r.Body == nil {
 		return map[string]any{}, nil
 	}
+	defer r.Body.Close()
 	var body map[string]any
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec := json.NewDecoder(io.LimitReader(r.Body, 512))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -1117,9 +1159,18 @@ func (s *Server) writeCORS(w http.ResponseWriter) {
 	h.Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
+// jsonBufPool recycles byte buffers for JSON encoding — avoids per-response alloc.
+var jsonBufPool = sync.Pool{New: func() any { return new([]byte) }}
+
 func (s *Server) writeJSON(w http.ResponseWriter, status int, body map[string]any) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte{'\n'})
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────
